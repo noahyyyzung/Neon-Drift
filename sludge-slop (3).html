@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sludge Slop</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #10150d; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #e9f5c9; }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; outline: none; }
+  #ui { position: fixed; left: 16px; top: 14px; right: 16px; pointer-events: none; text-shadow: 0 2px 6px #000; }
+  #ui h1 { margin: 0; font-size: 26px; letter-spacing: 3px; color: #b6ff4a; }
+  #ui p { margin: 6px 0 0; font-size: 13px; line-height: 1.5; opacity: .9; max-width: 560px; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 18px; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 0 16px; }
+  #btn-vr { padding: 14px 30px; font: 700 16px system-ui, sans-serif; letter-spacing: 2px; color: #b6ff4a; background: #1a2a10;
+    border: 2px solid #b6ff4a; border-radius: 8px; cursor: pointer; }
+  #btn-vr:disabled { opacity: .45; cursor: default; }
+  #status { font: 13px/1.4 system-ui, sans-serif; color: #d8eaa6; text-align: center; max-width: 640px; text-shadow: 0 1px 4px #000; }
+  #status.bad { color: #ffb3a8; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="ui">
+  <h1>SLUDGE SLOP <span style="font-size:13px;letter-spacing:1px;opacity:.7">v0.5</span></h1>
+  <p>Desktop preview: WASD to walk, Shift to run, Space to jump, drag to look around, scroll to zoom.<br>
+  On a Quest: open this page in the Meta Quest Browser and press Enter VR.</p>
+</div>
+<div id="bar">
+  <button id="btn-vr" type="button" disabled>ENTER VR</button>
+  <div id="status">Loading...</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* =====================================================================
+   SLUDGE SLOP  v0.5  -  player model + movement test area
+   three.js r128 (classic script), same VR start-up as Neon Rift.
+   ===================================================================== */
+(function () {
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const btn = $('btn-vr');
+function setStatus(msg, bad) { statusEl.textContent = msg; statusEl.className = bad ? 'bad' : ''; }
+const shown = {};
+let vrNote = () => {};
+function fail(msg) { if (shown[msg]) return; shown[msg] = 1; console.error(msg); setStatus(msg, true); vrNote(msg); }
+window.addEventListener('error', (e) => fail('Error: ' + e.message));
+window.addEventListener('unhandledrejection', (e) => fail('Error: ' + ((e.reason && e.reason.message) || e.reason)));
+
+if (typeof THREE === 'undefined') { setStatus('Could not load three.js. Check your connection and reload the page.', true); return; }
+
+/* ---------- tuning ---------- */
+const BODY_DROP = 0.6;       // your virtual body sits this far below your real floor, so your hands reach the ground easily
+const ARM_SCALE = 1.35;      // virtual arms are this much longer than your real ones
+const HAND_R = 0.06;         // hand collision radius
+const HAND_PITCH_DEG = 0;    // fine-tune how the hand sits on your controller (tilts the hand up/down at the wrist)
+const RELEASE = 0.006;       // how far a hand has to move away from a surface (in one frame) to let go; small = not sticky
+const GRAVITY = 9.8;
+const AIR_DRAG = 0.15;
+const GROUND_FRICTION = 6;
+const MAX_SPEED = 9;
+const WALK_BOOST = 0.2;      // extra glide when you pull yourself along the ground (0.2 = 20% farther per stroke while your hand is on the ground)
+const JUMP_MULT = 1.45;       // launch boost when you let go
+const GROUND_R = 14;         // radius of the test area
+const MIRROR_Z = -1.5;
+const SNAP_DEG = 30;
+
+const V3 = (x, y, z) => new THREE.Vector3(x || 0, y || 0, z || 0);
+const clamp = THREE.MathUtils.clamp;
+const SPAWN = V3(0, 0, 1.5);
+
+/* =====================================================================
+   Renderer / scene
+   ===================================================================== */
+const canvas = $('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.xr.enabled = true;
+renderer.localClippingEnabled = true;
+
+const scene = new THREE.Scene();
+const FOG = 0x55652f;
+scene.background = new THREE.Color(FOG);
+scene.fog = new THREE.Fog(FOG, 22, 80);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 300);
+scene.add(camera);                             // desktop preview: camera lives in the scene
+const rig = new THREE.Group(); scene.add(rig); // VR: moving the rig moves the player
+const refGroup = new THREE.Group(); rig.add(refGroup);   // holds camera + controllers; lifted 1.6 m only if the headset has no floor tracking
+let floorOffset = 0;
+
+scene.add(new THREE.HemisphereLight(0xd6e8a4, 0x2b2a1a, 1.0));
+const sun = new THREE.DirectionalLight(0xfff0c0, 0.9);
+sun.position.set(-8, 14, 6); scene.add(sun);
+
+function attachCamera(inRig) {
+  if (inRig) { scene.remove(camera); refGroup.add(camera); camera.position.set(0, 0, 0); camera.quaternion.identity(); }
+  else { refGroup.remove(camera); scene.add(camera); }
+}
+
+/* =====================================================================
+   Procedural textures (marker-scribble look, like the drawing)
+   ===================================================================== */
+function rng(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function tex(c, repeat) {
+  const t = new THREE.CanvasTexture(c);
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat, repeat); }
+  t.anisotropy = 4;
+  return t;
+}
+function scribble(w, h, seed, base, tones, count, width) {
+  width = width || [6, 18];
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d'), r = rng(seed);
+  g.fillStyle = base; g.fillRect(0, 0, w, h);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  for (let i = 0; i < count; i++) {
+    g.strokeStyle = tones[(r() * tones.length) | 0];
+    g.globalAlpha = 0.3 + r() * 0.4;
+    g.lineWidth = width[0] + r() * (width[1] - width[0]);
+    let x = r() * w, y = r() * h; const a = r() * 6.28, len = 30 + r() * 90;
+    g.beginPath(); g.moveTo(x, y);
+    for (let k = 0; k < 5; k++) {
+      x += Math.cos(a + (k % 2 ? 0.9 : -0.9)) * len / 3; y += Math.sin(a + (k % 2 ? 0.9 : -0.9)) * len / 3;
+      g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+  g.globalAlpha = 1;
+  return c;
+}
+const SKIN_BASE = '#e9726f', SKIN_TONES = ['#f48f8a', '#d85b5b', '#f6a39d', '#e2625f'];
+const SKIN_TEX = tex(scribble(256, 256, 11, SKIN_BASE, SKIN_TONES, 140));
+
+// face from the drawing: wide-set green eyes with black rims, two small nose slashes, flat frown
+const FACE_TEX = (function () {
+  const W = 1024, H = 512;
+  const c = scribble(W, H, 7, SKIN_BASE, SKIN_TONES, 300);
+  const g = c.getContext('2d');
+  const cx = W * 0.75, cy = H * 0.5;            // u = 0.75 is the forward (-Z) side of a three.js sphere
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  const eye = (ex) => {
+    g.fillStyle = '#0b0b0b'; g.beginPath(); g.ellipse(ex, cy - 36, 44, 58, 0, 0, 7); g.fill();
+    g.fillStyle = '#2f9e3a'; g.beginPath(); g.ellipse(ex, cy - 36, 32, 46, 0, 0, 7); g.fill();
+    g.strokeStyle = '#86dd6e'; g.lineWidth = 6; g.beginPath(); g.arc(ex + 2, cy - 40, 22, 3.5, 5.3); g.stroke();
+    g.strokeStyle = '#1f6d28'; g.lineWidth = 5; g.beginPath(); g.arc(ex, cy - 32, 26, 0.4, 2.4); g.stroke();
+  };
+  eye(cx - 104); eye(cx + 104);
+  g.strokeStyle = '#0b0b0b'; g.lineWidth = 9;
+  g.beginPath(); g.moveTo(cx - 30, cy + 6); g.lineTo(cx - 18, cy + 34); g.stroke();
+  g.beginPath(); g.moveTo(cx + 30, cy + 2); g.lineTo(cx + 20, cy + 28); g.stroke();
+  g.lineWidth = 13;
+  g.beginPath(); g.moveTo(cx - 62, cy + 96); g.quadraticCurveTo(cx, cy + 80, cx + 62, cy + 96); g.stroke();
+  return tex(c);
+})();
+
+// chest badge from the drawing: black plate, red stripe on top, two rows of grey marks
+const PLATE_TEX = (function () {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = '#0d0d0d'; g.fillRect(0, 0, 256, 128);
+  g.fillStyle = '#d8261c'; g.fillRect(14, 12, 228, 14);
+  g.fillStyle = '#cfcfcf';
+  for (let r = 0; r < 2; r++) for (let k = 0; k < 9; k++) g.fillRect(14 + k * 25.5, 44 + r * 38, 18, 26);
+  return tex(c);
+})();
+
+/* =====================================================================
+   Avatar: the Sludge Monkey
+   Built from simple shapes with a black outline (inverted hull) to match the marker drawing.
+   It is driven by a plain pose (head position/rotation + two hand positions),
+   so the same pose can be sent over the network later.
+   ===================================================================== */
+function makeMaterials(clip) {
+  const m = {
+    skin: new THREE.MeshLambertMaterial({ map: SKIN_TEX }),
+    head: new THREE.MeshLambertMaterial({ map: FACE_TEX }),
+    black: new THREE.MeshLambertMaterial({ color: 0x161616 }),
+    plate: new THREE.MeshLambertMaterial({ map: PLATE_TEX }),
+    outline: new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.BackSide }),
+  };
+  m.outline.onBeforeCompile = function (s) {
+    s.vertexShader = s.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n transformed += normalize(normal) * 0.009;');
+  };
+  if (clip) for (const k in m) m[k].clippingPlanes = clip;
+  return m;
+}
+function part(geo, mat, outlineMat, parent, pos) {
+  const mesh = new THREE.Mesh(geo, mat);
+  if (outlineMat) mesh.add(new THREE.Mesh(geo, outlineMat));
+  if (pos) mesh.position.copy(pos);
+  if (parent) parent.add(mesh);
+  return mesh;
+}
+function lathe(pts) { return new THREE.LatheGeometry(pts.map((p) => new THREE.Vector2(p[0], p[1])), 32); }
+function limbGeo(rStart, rEnd) {                 // cylinder from y=0 to y=1
+  const g = new THREE.CylinderGeometry(rEnd, rStart, 1, 20, 1); g.translate(0, 0.5, 0); return g;
+}
+
+// v0.3: slimmer and smaller than v0.2 (SX = narrower, torso shorter, smaller head/arms/hands), 3 digits per hand
+const TORSO_H = 0.56, HEAD_R = 0.125, NECK_UP = 0.03;
+const ARM_L1 = 0.36, ARM_L2 = 0.36;
+const SX = 0.78, SY = TORSO_H / 0.67;           // scale of the old torso shape
+const SHOULDER_X = 0.29, SHOULDER_Y = 0.48;     // shoulder joint, relative to the bottom of the torso
+const TORSO_CUT = (SHOULDER_Y - ARM_L1 - 0.04) / SY;   // v0.5: the torso ends just below the elbow of a hanging arm
+const PALM_OFF = 0.042;                         // palm centre sits this far from the wrist
+const scaleProfile = (pts) => pts.map((p) => [p[0] * SX, p[1] * SY]);
+const GEO = {
+  head: new THREE.SphereGeometry(HEAD_R, 40, 28),
+  neck: new THREE.CylinderGeometry(0.058, 0.07, 0.16, 14),
+  torso: lathe(scaleProfile([[0, TORSO_CUT], [0.15, TORSO_CUT + 0.004], [0.205, TORSO_CUT + 0.03], [0.235, 0.18], [0.25, 0.30], [0.30, 0.44], [0.345, 0.55],
+                             [0.315, 0.62], [0.20, 0.655], [0.09, 0.67], [0, 0.67]])),
+  plate: new THREE.BoxGeometry(0.13, 0.065, 0.024),
+  upper: limbGeo(0.09, 0.074),
+  fore: limbGeo(0.078, 0.052),
+  ball: new THREE.SphereGeometry(1, 20, 14),
+  palm: new THREE.SphereGeometry(0.058, 18, 14),
+  finger: [0.05, 0.06].map((l) => limbGeo(0.016, 0.013).scale(1, l, 1)),
+  tip: new THREE.SphereGeometry(0.014, 10, 8),
+  thumb: limbGeo(0.018, 0.014).scale(1, 0.045, 1),
+  band: new THREE.CylinderGeometry(0.084, 0.088, 0.028, 20),
+};
+const FINGER_LEN = [0.05, 0.06];
+
+// each hand has exactly 3 digits: two fingers and a thumb
+function makeHand(M, side) {
+  const g = new THREE.Group();
+  const palm = part(GEO.palm, M.skin, M.outline, g, V3(0, PALM_OFF, 0));
+  palm.scale.set(1.2, 1.0, 0.8);
+  const fingers = [];
+  [-0.024, 0.024].forEach((x, i) => {
+    const piv = new THREE.Group(); piv.position.set(x, 0.078, 0); g.add(piv);
+    part(GEO.finger[i], M.skin, M.outline, piv, V3(0, 0.01, 0));
+    part(GEO.tip, M.skin, M.outline, piv, V3(0, 0.01 + FINGER_LEN[i], 0));
+    fingers.push(piv);
+  });
+  const thumb = new THREE.Group();
+  thumb.position.set(side < 0 ? 0.055 : -0.055, 0.03, 0);
+  thumb.rotation.z = side < 0 ? -0.85 : 0.85;
+  g.add(thumb);
+  part(GEO.thumb, M.skin, M.outline, thumb);
+  part(GEO.tip, M.skin, M.outline, thumb, V3(0, 0.045, 0));
+  g.userData = { fingers, thumb, side };
+  return g;
+}
+
+function makeArm(M, side) {
+  const arm = {
+    side,
+    shoulder: part(GEO.ball, M.skin, M.outline, null),
+    upper: new THREE.Group(), fore: new THREE.Group(), hand: makeHand(M, side),
+    upperMesh: part(GEO.upper, M.skin, M.outline, null),
+    foreMesh: part(GEO.fore, M.skin, M.outline, null),
+  };
+  arm.shoulder.scale.setScalar(0.095);
+  arm.upper.add(arm.upperMesh);
+  arm.band = part(GEO.band, M.black, null, arm.upper, V3(0, ARM_L1 * 0.55, 0));        // the dark dash on the arm
+  const elbow = part(GEO.ball, M.skin, M.outline, arm.fore); elbow.scale.setScalar(0.075);
+  arm.fore.add(arm.foreMesh);
+  const wrist = part(GEO.ball, M.skin, M.outline, arm.hand); wrist.scale.setScalar(0.052);
+  return arm;
+}
+
+const T = {                                       // scratch vectors for the avatar (kept separate from the physics ones)
+  a: V3(), b: V3(), c: V3(), d: V3(), e: V3(), f: V3(), fwd: V3(), right: V3(), pole: V3(), perp: V3(),
+  x: V3(), y: V3(), z: V3(), m: new THREE.Matrix4(),
+};
+const Y_AXIS = V3(0, 1, 0);
+
+// hand state used by the avatar: p = palm position (world), q = hand rotation (world) when we have one,
+// i / m / t = how much the index finger, middle finger and thumb are curled (0..1)
+function makeHandState() { return { p: V3(), q: new THREE.Quaternion(), hasQ: false, i: 0, m: 0, t: 0 }; }
+
+function makeAvatar(clip) {
+  const M = makeMaterials(clip);
+  const root = new THREE.Group();
+  const headG = new THREE.Group(); root.add(headG);
+  part(GEO.head, M.head, M.outline, headG);
+  const body = new THREE.Group(); root.add(body);
+  const neck = part(GEO.neck, M.skin, M.outline, body, V3(0, TORSO_H + NECK_UP, 0));
+  const torso = part(GEO.torso, M.skin, M.outline, body); torso.scale.z = 0.58;
+  part(GEO.plate, M.plate, null, body, V3(0, 0.36, -0.13));
+  const arms = [makeArm(M, -1), makeArm(M, 1)];
+  for (const a of arms) root.add(a.shoulder, a.upper, a.fore, a.hand);
+  root.traverse((o) => { o.frustumCulled = false; });     // parts are moved every frame; skip culling
+
+  const av = { root, headG, body, arms, yaw: 0, first: true };
+  av.setHeadVisible = (v) => { headG.visible = v; neck.visible = v; };
+
+  av.update = function (dt, headPos, headQuat, L, R) {
+    headG.position.copy(headPos); headG.quaternion.copy(headQuat);
+    // body heading follows the head (falls back to the up vector when looking straight up/down)
+    T.fwd.set(0, 0, -1).applyQuaternion(headQuat);
+    if (Math.hypot(T.fwd.x, T.fwd.z) < 0.35) {
+      T.a.set(0, 1, 0).applyQuaternion(headQuat);
+      const s = T.fwd.y < 0 ? 1 : -1; T.fwd.set(T.a.x * s, 0, T.a.z * s);
+    }
+    const targetYaw = Math.atan2(-T.fwd.x, -T.fwd.z);
+    if (av.first) { av.yaw = targetYaw; av.first = false; }
+    let d = targetYaw - av.yaw; d = Math.atan2(Math.sin(d), Math.cos(d));
+    av.yaw += d * Math.min(1, dt * 6);
+    body.rotation.set(0, av.yaw, 0);
+    T.fwd.set(-Math.sin(av.yaw), 0, -Math.cos(av.yaw));
+    body.position.set(headPos.x, headPos.y - HEAD_R - TORSO_H - NECK_UP, headPos.z).addScaledVector(T.fwd, -0.03);
+    body.updateMatrixWorld(true);
+    solveArm(arms[0], L);
+    solveArm(arms[1], R);
+  };
+
+  function solveArm(arm, hs) {
+    const side = arm.side;
+    const sh = T.a.set(side * SHOULDER_X, SHOULDER_Y, 0); body.localToWorld(sh);      // shoulder in world space
+    T.right.set(1, 0, 0).applyQuaternion(body.quaternion);
+    T.fwd.set(0, 0, -1).applyQuaternion(body.quaternion);
+
+    // wrist sits just behind the palm, along the hand's own finger direction
+    const toHand = T.b.copy(hs.p).sub(sh); const dist0 = toHand.length() || 1e-4; toHand.divideScalar(dist0);
+    const fingerDir = hs.hasQ ? T.y.set(0, 1, 0).applyQuaternion(hs.q) : T.y.copy(toHand);
+    const wrist = T.c.copy(hs.p).addScaledVector(fingerDir, -PALM_OFF);
+
+    // two-bone IK; if the hand is out of reach both bones stretch evenly (long gorilla arms)
+    const dv = T.d.copy(wrist).sub(sh); const dist = dv.length(); const dir = dv.divideScalar(dist || 1e-4);
+    const reach = ARM_L1 + ARM_L2;
+    let upperLen = ARM_L1, foreLen = ARM_L2;
+    const elbow = T.e;
+    if (dist >= reach) {
+      const k = dist / reach; upperLen = ARM_L1 * k; foreLen = ARM_L2 * k;
+      elbow.copy(sh).addScaledVector(dir, upperLen);
+    } else {
+      const a = Math.max(dist, 0.05);
+      const cosA = clamp((ARM_L1 * ARM_L1 + a * a - ARM_L2 * ARM_L2) / (2 * ARM_L1 * a), -1, 1);
+      const ang = Math.acos(cosA);
+      T.pole.set(0, -0.55, 0).addScaledVector(T.right, side * 0.8).addScaledVector(T.fwd, -0.45);
+      T.perp.copy(T.pole).addScaledVector(dir, -T.pole.dot(dir));
+      if (T.perp.lengthSq() < 1e-6) T.perp.set(0, -1, 0);
+      T.perp.normalize();
+      elbow.copy(sh).addScaledVector(dir, ARM_L1 * Math.cos(ang)).addScaledVector(T.perp, ARM_L1 * Math.sin(ang));
+    }
+
+    arm.shoulder.position.copy(sh);
+    arm.upper.position.copy(sh);
+    T.f.copy(elbow).sub(sh).normalize();
+    arm.upper.quaternion.setFromUnitVectors(Y_AXIS, T.f);
+    arm.upperMesh.scale.y = upperLen;
+    arm.band.position.y = upperLen * 0.55;
+    arm.fore.position.copy(elbow);
+    T.f.copy(wrist).sub(elbow); const fl = T.f.length() || 1e-4; T.f.divideScalar(fl);
+    arm.fore.quaternion.setFromUnitVectors(Y_AXIS, T.f);
+    arm.foreMesh.scale.y = foreLen;
+
+    arm.hand.position.copy(wrist);
+    if (hs.hasQ) {
+      arm.hand.quaternion.copy(hs.q);                                   // full wrist rotation: the hand turns with your controller
+    } else {                                                            // no controller (desktop preview): hand hangs along the forearm
+      const Yh = T.y.copy(T.f);
+      const Xh = T.x.copy(T.fwd).multiplyScalar(side < 0 ? 1 : -1);
+      Xh.addScaledVector(Yh, -Xh.dot(Yh));
+      if (Xh.lengthSq() < 1e-4) Xh.copy(T.right).multiplyScalar(side);
+      Xh.normalize();
+      const Zh = T.z.crossVectors(Xh, Yh);
+      T.m.makeBasis(Xh, Yh, Zh); arm.hand.quaternion.setFromRotationMatrix(T.m);
+    }
+    const u = arm.hand.userData;
+    u.fingers[0].rotation.x = -hs.i * 1.55;
+    u.fingers[1].rotation.x = -hs.m * 1.55;
+    u.thumb.rotation.x = -hs.t * 0.9;
+  }
+  return av;
+}
+
+/* =====================================================================
+   World: sky, ground, props, colliders
+   ===================================================================== */
+const boxes = [], spheres = [];
+function addBox(cx, cy, cz, w, h, d) { boxes.push({ min: V3(cx - w / 2, cy - h / 2, cz - d / 2), max: V3(cx + w / 2, cy + h / 2, cz + d / 2) }); }
+function addSphere(x, y, z, r) { spheres.push({ c: V3(x, y, z), r }); }
+
+(function buildWorld() {
+  // sky dome
+  const sky = new THREE.SphereGeometry(200, 24, 16);
+  const col = [], top = new THREE.Color(0x16231f), hor = new THREE.Color(0x73843c), tmp = new THREE.Color();
+  const p = sky.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const k = clamp(p.getY(i) / 200, 0, 1);
+    tmp.copy(hor).lerp(top, Math.pow(k, 0.55)); col.push(tmp.r, tmp.g, tmp.b);
+  }
+  sky.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  scene.add(new THREE.Mesh(sky, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false })));
+
+  // ground disc + glowing sludge puddles
+  const gtex = tex(scribble(512, 512, 3, '#4a4d2a', ['#3a3d20', '#5c5f33', '#44502a', '#2f3a1f'], 420, [10, 34]), 8);
+  const ground = new THREE.Mesh(new THREE.CircleGeometry(GROUND_R, 72), new THREE.MeshLambertMaterial({ map: gtex }));
+  ground.rotation.x = -Math.PI / 2; scene.add(ground);
+  const side = new THREE.Mesh(new THREE.CylinderGeometry(GROUND_R, GROUND_R - 1.5, 6, 72, 1, true),
+    new THREE.MeshLambertMaterial({ color: 0x2e2a1a, side: THREE.DoubleSide }));
+  side.position.y = -3; scene.add(side);
+  const pm = new THREE.MeshBasicMaterial({ color: 0x8dff4a, transparent: true, opacity: 0.55 });
+  [[5, 4, 1.4], [-6, 5, 1.8], [8, 0, 1.0], [-2, -8, 1.6], [2, 9, 1.2], [-9, -1, 1.4]].forEach(([x, z, r]) => {
+    const m = new THREE.Mesh(new THREE.CircleGeometry(r, 28), pm);
+    m.rotation.x = -Math.PI / 2; m.position.set(x, 0.012, z); scene.add(m);
+  });
+  // start ring
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.85, 1.0, 40), new THREE.MeshBasicMaterial({ color: 0xb6ff4a, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; ring.position.set(SPAWN.x, 0.015, SPAWN.z); scene.add(ring);
+
+  // boulder ring around the edge, so nobody walks off by accident (you can still jump off to test respawn)
+  const rockMat = new THREE.MeshLambertMaterial({ color: 0x6b6a5a });
+  const r2 = rng(99);
+  for (let i = 0; i < 26; i++) {
+    const a = (i / 26) * Math.PI * 2, rad = 1.3 + r2() * 0.6;
+    const x = Math.cos(a) * (GROUND_R + 0.2), z = Math.sin(a) * (GROUND_R + 0.2), y = rad * 0.35;
+    const m = new THREE.Mesh(new THREE.IcosahedronGeometry(rad, 1), rockMat);
+    m.position.set(x, y, z); m.rotation.set(r2() * 3, r2() * 3, r2() * 3); scene.add(m); addSphere(x, y, z, rad);
+  }
+  // rocks to grab and climb
+  [[-6, 2, 1.2], [6, 5, 1.0], [-9, -3, 1.4]].forEach(([x, z, r]) => {
+    const y = r * 0.3, m = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 1), rockMat);
+    m.position.set(x, y, z); m.rotation.set(r * 2, r, 0); scene.add(m); addSphere(x, y, z, r);
+  });
+
+  // crates
+  const cc = document.createElement('canvas'); cc.width = cc.height = 128;
+  const cg = cc.getContext('2d');
+  cg.fillStyle = '#8a6334'; cg.fillRect(0, 0, 128, 128);
+  cg.strokeStyle = '#3d2a14'; cg.lineWidth = 10; cg.strokeRect(5, 5, 118, 118);
+  cg.lineWidth = 8; cg.beginPath(); cg.moveTo(8, 8); cg.lineTo(120, 120); cg.moveTo(120, 8); cg.lineTo(8, 120); cg.stroke();
+  const crateMat = new THREE.MeshLambertMaterial({ map: tex(cc) });
+  const crate = (x, y, z, w, h, d) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), crateMat);
+    m.position.set(x, y, z); scene.add(m); addBox(x, y, z, w, h, d);
+  };
+  crate(6, 0.25, -4, 1.4, 0.5, 1.4);                    // stairs
+  crate(7.4, 0.5, -4, 1.4, 1.0, 1.4);
+  crate(8.8, 0.75, -4, 1.4, 1.5, 1.4);
+  crate(-3, 0.4, 6, 0.8, 0.8, 0.8);                     // small pile
+  crate(-2.1, 0.4, 6.2, 0.8, 0.8, 0.8);
+  crate(-2.6, 1.2, 6.1, 0.8, 0.8, 0.8);
+  crate(3.5, 0.3, 8, 1.0, 0.6, 1.0);
+
+  // concrete: wall to climb, tall pillar, raised platform
+  const conc = new THREE.MeshLambertMaterial({ color: 0x7c7f74 });
+  const solid = (x, y, z, w, h, d) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), conc);
+    m.position.set(x, y, z); scene.add(m); addBox(x, y, z, w, h, d);
+  };
+  solid(-8, 1.6, -6, 5, 3.2, 0.5);
+  solid(-4.5, 1.1, -9, 0.7, 2.2, 0.7);
+  solid(1, 0.5, -10, 6, 1.0, 3.5);
+
+  // mirror frame + glass
+  const metal = new THREE.MeshLambertMaterial({ color: 0x2b2e2b });
+  const fb = (x, y, w, h) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.3), metal);
+    m.position.set(x, y, MIRROR_Z); scene.add(m); addBox(x, y, MIRROR_Z, w, h, 0.3);
+  };
+  fb(-1.7, 1.35, 0.2, 2.7); fb(1.7, 1.35, 0.2, 2.7); fb(0, 2.75, 3.6, 0.2); fb(0, 0.1, 3.6, 0.2);
+  const glass = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 2.6),
+    new THREE.MeshBasicMaterial({ color: 0xa6e0cf, transparent: true, opacity: 0.1, depthWrite: false }));
+  glass.position.set(0, 1.4, MIRROR_Z + 0.02); scene.add(glass);
+
+  // title sign above the mirror
+  const sc = document.createElement('canvas'); sc.width = 1024; sc.height = 256;
+  const sg = sc.getContext('2d');
+  sg.fillStyle = '#10150d'; sg.fillRect(0, 0, 1024, 256);
+  sg.strokeStyle = '#b6ff4a'; sg.lineWidth = 10; sg.strokeRect(10, 10, 1004, 236);
+  sg.fillStyle = '#b6ff4a'; sg.font = '900 150px Impact, "Arial Black", sans-serif';
+  sg.textAlign = 'center'; sg.textBaseline = 'middle'; sg.shadowColor = '#7dff3a'; sg.shadowBlur = 30;
+  sg.fillText('SLUDGE SLOP', 512, 136);
+  const sign = new THREE.Mesh(new THREE.PlaneGeometry(6, 1.5), new THREE.MeshBasicMaterial({ map: tex(sc), side: THREE.DoubleSide }));
+  sign.position.set(0, 4.0, MIRROR_Z - 0.2); scene.add(sign);
+  [-2.8, 2.8].forEach((x) => {
+    const post = new THREE.Mesh(new THREE.BoxGeometry(0.25, 3.3, 0.25), metal);
+    post.position.set(x, 1.65, MIRROR_Z - 0.2); scene.add(post); addBox(x, 1.65, MIRROR_Z - 0.2, 0.25, 3.3, 0.25);
+  });
+})();
+
+/* =====================================================================
+   Collision: pushes a sphere (p, r) out of the world, returns true if it touched something
+   ===================================================================== */
+function pushOut(p, r, nOut) {
+  let hit = false;
+  if (Math.hypot(p.x, p.z) < GROUND_R + 0.05 && p.y < r && p.y > -1.5) {
+    p.y = r; nOut.set(0, 1, 0); hit = true;
+  }
+  for (const b of boxes) {
+    const cx = clamp(p.x, b.min.x, b.max.x), cy = clamp(p.y, b.min.y, b.max.y), cz = clamp(p.z, b.min.z, b.max.z);
+    const dx = p.x - cx, dy = p.y - cy, dz = p.z - cz, d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 >= r * r) continue;
+    if (d2 > 1e-10) {
+      const d = Math.sqrt(d2), k = (r - d) / d;
+      p.x += dx * k; p.y += dy * k; p.z += dz * k; nOut.set(dx / d, dy / d, dz / d);
+    } else {                                    // centre is inside the box: leave through the nearest face
+      const f = [p.x - b.min.x, b.max.x - p.x, p.y - b.min.y, b.max.y - p.y, p.z - b.min.z, b.max.z - p.z];
+      let mi = 0; for (let i = 1; i < 6; i++) if (f[i] < f[mi]) mi = i;
+      nOut.set(0, 0, 0);
+      switch (mi) {
+        case 0: p.x = b.min.x - r; nOut.x = -1; break; case 1: p.x = b.max.x + r; nOut.x = 1; break;
+        case 2: p.y = b.min.y - r; nOut.y = -1; break; case 3: p.y = b.max.y + r; nOut.y = 1; break;
+        case 4: p.z = b.min.z - r; nOut.z = -1; break; default: p.z = b.max.z + r; nOut.z = 1;
+      }
+    }
+    hit = true;
+  }
+  for (const s of spheres) {
+    const dx = p.x - s.c.x, dy = p.y - s.c.y, dz = p.z - s.c.z, d = Math.hypot(dx, dy, dz), R = s.r + r;
+    if (d >= R) continue;
+    if (d > 1e-6) { const k = (R - d) / d; p.x += dx * k; p.y += dy * k; p.z += dz * k; nOut.set(dx / d, dy / d, dz / d); }
+    else { p.y += R; nOut.set(0, 1, 0); }
+    hit = true;
+  }
+  return hit;
+}
+
+/* =====================================================================
+   Avatars in the scene: you + your reflection in the mirror
+   ===================================================================== */
+const MIRROR_W = 1.6;
+const mirrorClip = [
+  new THREE.Plane(V3(0, 0, -1), MIRROR_Z),      // only keep what is behind the glass
+  new THREE.Plane(V3(1, 0, 0), MIRROR_W),
+  new THREE.Plane(V3(-1, 0, 0), MIRROR_W),
+  new THREE.Plane(V3(0, 1, 0), -0.12),
+  new THREE.Plane(V3(0, -1, 0), 2.65),
+];
+const avatar = makeAvatar(null);
+const mirrorAvatar = makeAvatar(mirrorClip);
+scene.add(avatar.root, mirrorAvatar.root);
+
+const pose = { head: V3(0, 1.1, 0), q: new THREE.Quaternion(), L: makeHandState(), R: makeHandState() };
+const _mh = V3(), _mq = new THREE.Quaternion(), _mm = new THREE.Matrix4();
+const _mf = V3(), _mu = V3(), _mz = V3(), _mx = V3();
+const _mL = makeHandState(), _mR = makeHandState();
+const _bx = V3(), _by = V3(), _bz = V3();
+function reflectPos(p, out) { return out.set(p.x, p.y, 2 * MIRROR_Z - p.z); }
+// the reflection of a hand is the opposite hand: same finger curl, position flipped through the glass, rotation mirrored
+function reflectHand(src, out) {
+  reflectPos(src.p, out.p);
+  out.i = src.i; out.m = src.m; out.t = src.t; out.hasQ = src.hasQ;
+  if (src.hasQ) {
+    _bx.set(1, 0, 0).applyQuaternion(src.q); _by.set(0, 1, 0).applyQuaternion(src.q); _bz.set(0, 0, 1).applyQuaternion(src.q);
+    _bx.set(-_bx.x, -_bx.y, _bx.z); _by.z *= -1; _bz.z *= -1;
+    _mm.makeBasis(_bx, _by, _bz); out.q.setFromRotationMatrix(_mm);
+  }
+}
+function updateMirror(dt) {
+  reflectPos(pose.head, _mh);
+  reflectHand(pose.R, _mL); reflectHand(pose.L, _mR);                       // the reflection's left hand is your right hand
+  _mf.set(0, 0, -1).applyQuaternion(pose.q); _mf.z *= -1;
+  _mu.set(0, 1, 0).applyQuaternion(pose.q); _mu.z *= -1;
+  _mz.copy(_mf).negate();
+  _mx.crossVectors(_mu, _mz).normalize();
+  _mm.makeBasis(_mx, _mu, _mz); _mq.setFromRotationMatrix(_mm);
+  mirrorAvatar.update(dt, _mh, _mq, _mL, _mR);
+}
+
+/* =====================================================================
+   VR input + Gorilla Tag movement
+   Hands stick to whatever they touch. While a hand is stuck your body moves so the hand stays put,
+   so pulling yourself along the ground / up a wall / off a rock works like Gorilla Tag.
+   ===================================================================== */
+const ctrls = [renderer.xr.getController(0), renderer.xr.getController(1)];
+const grips = [renderer.xr.getControllerGrip(0), renderer.xr.getControllerGrip(1)];
+ctrls.forEach((c, i) => {
+  c.userData = { hand: '', input: null };
+  c.addEventListener('connected', (e) => { c.userData.hand = e.data.handedness || ''; c.userData.input = e.data; });
+  c.addEventListener('disconnected', () => { c.userData.hand = ''; c.userData.input = null; });
+  refGroup.add(c, grips[i]);
+});
+
+const hands = [0, 1].map(() => ({ touch: false, anchor: V3(), normal: V3(0, 1, 0), world: V3() }));
+const loco = { vel: V3(), hist: [], wasTouch: false, onGround: false, turnLatch: false, clock: 0 };
+const _a = V3(), _b = V3(), _c = V3(), _n = V3(), _d = V3(), _snap = V3();
+
+function respawn() {
+  rig.position.set(SPAWN.x, SPAWN.y - BODY_DROP, SPAWN.z);
+  rig.rotation.set(0, 0, 0);
+  loco.vel.set(0, 0, 0); loco.hist.length = 0; loco.wasTouch = false;
+  hands.forEach((h) => { h.touch = false; });
+  rig.updateMatrixWorld(true);
+}
+
+// headL / handL are positions in rig space
+function stepLocomotion(dt, headL, handL) {
+  loco.clock += dt;
+  rig.updateMatrixWorld(true);
+  const before = _d.copy(rig.position);
+  _snap.set(0, 0, 0);                                // movement caused by a hand first landing on a surface (not counted as speed)
+  let touch = false;
+
+  for (let i = 0; i < 2; i++) {
+    const h = hands[i];
+    h.world.copy(handL[i]); rig.localToWorld(h.world);
+    if (h.touch) {
+      const sep = _a.copy(h.world).sub(h.anchor).dot(h.normal);
+      if (sep > RELEASE) h.touch = false;
+      else {
+        _b.copy(h.anchor).sub(h.world);                     // the body moves by exactly how far the hand moved...
+        if (h.normal.y > 0.7) {                             // ...plus a little extra when on the ground or a flat top, so walking is a bit faster
+          _a.copy(_b).addScaledVector(h.normal, -_b.dot(h.normal));    // the sideways part of the pull
+          _c.copy(h.anchor).addScaledVector(_a, WALK_BOOST).addScaledVector(h.normal, -0.01);
+          if (pushOut(_c, HAND_R, _n)) { _b.addScaledVector(_a, WALK_BOOST); h.anchor.addScaledVector(_a, WALK_BOOST); }   // only if there is still ground there
+        }
+        rig.position.add(_b); rig.updateMatrixWorld(true); touch = true; continue;
+      }
+    }
+    _c.copy(h.world);
+    if (pushOut(_c, HAND_R, _n)) {
+      h.touch = true; h.anchor.copy(_c); h.normal.copy(_n);
+      _b.copy(_c).sub(h.world); _snap.add(_b);
+      rig.position.add(_b); rig.updateMatrixWorld(true);
+      touch = true;
+    }
+  }
+
+  // remember how fast the hands moved the body; launch with that speed on release
+  const delta = _a.copy(rig.position).sub(before).sub(_snap);
+  if (touch) {
+    loco.vel.set(0, 0, 0);
+    loco.hist.push({ v: delta.clone().divideScalar(Math.max(dt, 1e-3)), t: loco.clock });
+    while (loco.hist.length && loco.clock - loco.hist[0].t > 0.1) loco.hist.shift();
+  } else if (loco.wasTouch && loco.hist.length) {
+    const avg = V3(); loco.hist.forEach((e) => avg.add(e.v)); avg.divideScalar(loco.hist.length).multiplyScalar(JUMP_MULT);
+    if (avg.length() > MAX_SPEED) avg.setLength(MAX_SPEED);
+    loco.vel.copy(avg); loco.hist.length = 0;
+  }
+  loco.wasTouch = touch;
+
+  if (!touch) {                                   // free flight
+    loco.vel.y -= GRAVITY * dt;
+    const dr = Math.exp(-AIR_DRAG * dt); loco.vel.x *= dr; loco.vel.z *= dr;
+    loco.vel.y = Math.max(loco.vel.y, -25);
+    rig.position.addScaledVector(loco.vel, dt);
+    rig.updateMatrixWorld(true);
+  }
+
+  // body collision: feet, chest, head
+  loco.onGround = false;
+  const spots = [[headL.x, BODY_DROP + 0.15, headL.z, 0.15], [headL.x, headL.y - 0.4, headL.z, 0.18], [headL.x, headL.y, headL.z, 0.14]];
+  for (const s of spots) {
+    _c.set(s[0], s[1], s[2]); rig.localToWorld(_c);
+    _b.copy(_c);
+    if (pushOut(_c, s[3], _n)) {
+      rig.position.add(_a.copy(_c).sub(_b)); rig.updateMatrixWorld(true);
+      const vn = loco.vel.dot(_n); if (vn < 0) loco.vel.addScaledVector(_n, -vn);
+      if (_n.y > 0.6) loco.onGround = true;
+    }
+  }
+  if (loco.onGround && !touch) { const f = Math.exp(-GROUND_FRICTION * dt); loco.vel.x *= f; loco.vel.z *= f; }
+  if (rig.position.y < -30) respawn();
+}
+
+function snapTurn(deg) {                           // turn around your head so you don't swing sideways
+  rig.updateMatrixWorld(true);
+  const hp = rig.localToWorld(V3(camera.position.x, camera.position.y + floorOffset, camera.position.z));
+  rig.rotation.y += THREE.MathUtils.degToRad(deg);
+  rig.updateMatrixWorld(true);
+  const hp2 = rig.localToWorld(V3(camera.position.x, camera.position.y + floorOffset, camera.position.z));
+  rig.position.add(hp.sub(hp2)); rig.updateMatrixWorld(true);
+}
+
+const handL = [V3(-0.3, 0.9, -0.2), V3(0.3, 0.9, -0.2)];
+const _head = V3(), _sh = V3(), _src = V3();
+// the hand's own axes (+Y = fingers, thumb side = +X on the left hand / -X on the right, palm faces -Z) expressed in the
+// controller's pointing frame (-Z = where it points, +Y = top). Fingers follow the pointing direction, thumb follows the top.
+const _mapM = new THREE.Matrix4();
+const MAP_R = new THREE.Quaternion().setFromRotationMatrix(_mapM.makeBasis(V3(0, -1, 0), V3(0, 0, -1), V3(1, 0, 0)));
+const MAP_L = new THREE.Quaternion().setFromRotationMatrix(_mapM.makeBasis(V3(0, 1, 0), V3(0, 0, -1), V3(-1, 0, 0)));
+const Q_PITCH = new THREE.Quaternion().setFromAxisAngle(V3(1, 0, 0), THREE.MathUtils.degToRad(HAND_PITCH_DEG));
+const ctrlIdx = [-1, -1];
+function stepXR(dt) {
+  renderer.xr.getCamera(camera);                    // refreshes camera.position/quaternion with the latest head pose
+  const headL = _head.set(camera.position.x, camera.position.y + floorOffset, camera.position.z);
+  _sh.copy(headL); _sh.y -= 0.22;                   // rough shoulder position
+
+  for (let i = 0; i < 2; i++) {
+    const idx = ctrls.findIndex((c) => c.userData.hand === (i === 0 ? 'left' : 'right'));
+    ctrlIdx[i] = idx;
+    if (idx < 0) continue;
+    const hs = i === 0 ? pose.L : pose.R;
+    const g = grips[idx];
+    const src = g.visible ? g.position : (ctrls[idx].visible ? ctrls[idx].position : null);
+    if (src) {
+      _src.set(src.x, src.y + floorOffset, src.z).sub(_sh);
+      handL[i].copy(_sh).addScaledVector(_src, ARM_SCALE);
+    }
+    const gp = ctrls[idx].userData.input && ctrls[idx].userData.input.gamepad;
+    if (gp && gp.buttons) {
+      const trig = gp.buttons[0] ? gp.buttons[0].value : 0, grip = gp.buttons[1] ? gp.buttons[1].value : 0;
+      const thumbOn = [3, 4, 5].some((k) => gp.buttons[k] && (gp.buttons[k].touched || gp.buttons[k].pressed));
+      hs.i = Math.max(trig, grip * 0.85);           // index finger: trigger or grip
+      hs.m = grip;                                   // other finger: grip
+      hs.t = Math.max(grip * 0.8, thumbOn ? 0.6 : 0); // thumb: grip, or resting on a button / stick
+    }
+    if (i === 1 && gp && gp.axes) {                 // right thumbstick = snap turn
+      const x = gp.axes.length >= 4 ? gp.axes[2] : gp.axes[0];
+      if (Math.abs(x) > 0.75) { if (!loco.turnLatch) { snapTurn(x > 0 ? -SNAP_DEG : SNAP_DEG); loco.turnLatch = true; } }
+      else if (Math.abs(x) < 0.4) loco.turnLatch = false;
+    }
+  }
+
+  stepLocomotion(dt, headL, handL);
+
+  // pose for the avatar (hands are kept on top of surfaces so they never sink in)
+  rig.updateMatrixWorld(true);
+  rig.localToWorld(pose.head.copy(headL));
+  pose.q.copy(rig.quaternion).multiply(camera.quaternion);
+  [pose.L, pose.R].forEach((hs, i) => {
+    hs.p.copy(handL[i]); rig.localToWorld(hs.p); pushOut(hs.p, HAND_R, _n);
+    const idx = ctrlIdx[i];
+    if (idx >= 0 && (ctrls[idx].visible || grips[idx].visible)) {   // full 360 wrist rotation: the hand turns exactly like the controller
+      hs.q.copy(rig.quaternion).multiply(ctrls[idx].quaternion).multiply(i === 0 ? MAP_L : MAP_R).multiply(Q_PITCH);
+      hs.hasQ = true;
+    }
+  });
+  avatar.update(dt, pose.head, pose.q, pose.L, pose.R);
+}
+
+/* ---------- starting / ending a VR session (same flow as Neon Rift) ---------- */
+function onSessionStart() { respawn(); $('ui').style.display = 'none'; avatar.setHeadVisible(false); }
+function onSessionEnd() {
+  attachCamera(false);
+  floorOffset = 0; refGroup.position.y = 0;
+  $('ui').style.display = ''; avatar.setHeadVisible(true); avatar.first = true;
+  resize();
+}
+async function enterVR() {
+  if (!navigator.xr) { setStatus('This browser has no WebXR. Open the page in the Meta Quest Browser.', true); return; }
+  btn.disabled = true; setStatus('Starting VR...');
+  let session = null;
+  try {
+    session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] });
+    let floorOk = true; try { await session.requestReferenceSpace('local-floor'); } catch (e) { floorOk = false; }
+    renderer.xr.setReferenceSpaceType(floorOk ? 'local-floor' : 'local');
+    floorOffset = floorOk ? 0 : 1.6; refGroup.position.y = floorOffset;
+    attachCamera(true);
+    await renderer.xr.setSession(session);
+    session.addEventListener('end', onSessionEnd);
+    onSessionStart();
+    setStatus('');
+  } catch (err) {
+    setStatus('Could not start VR: ' + (err && err.name ? err.name + ': ' : '') + (err && err.message ? err.message : err) +
+      ' (If this page is inside a frame, open it directly in the headset browser.)', true);
+    attachCamera(false);
+    try { if (session) session.end(); } catch (e) { /* already ended */ }
+  }
+  btn.disabled = false;
+}
+async function checkXR() {
+  if (!navigator.xr) { setStatus('VR is not available in this browser. Open the page in the Meta Quest Browser, or look around on screen.', true); return; }
+  btn.disabled = false;
+  try {
+    const ok = await navigator.xr.isSessionSupported('immersive-vr');
+    setStatus(ok ? 'VR headset found. Press Enter VR.' : 'No VR headset detected. You can still look around on screen.', !ok);
+  } catch (e) { setStatus('VR check failed. You can still look around on screen.', true); }
+}
+btn.addEventListener('click', enterVR);
+
+// small text panel in front of your face, so errors can be read inside the headset
+const panelCanvas = document.createElement('canvas'); panelCanvas.width = 640; panelCanvas.height = 200;
+const panelTex = new THREE.CanvasTexture(panelCanvas);
+const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.8, 0.25),
+  new THREE.MeshBasicMaterial({ map: panelTex, transparent: true, depthTest: false, fog: false }));
+panel.position.set(0, -0.12, -1.1); panel.renderOrder = 999; panel.visible = false;
+camera.add(panel);
+let panelUntil = 0;
+vrNote = function (msg) {
+  const g = panelCanvas.getContext('2d');
+  g.clearRect(0, 0, 640, 200); g.fillStyle = 'rgba(0,0,0,0.75)'; g.fillRect(0, 0, 640, 200);
+  g.font = '24px monospace'; g.fillStyle = '#ffb3a8'; g.textBaseline = 'top';
+  for (let i = 0, y = 10; i < msg.length && y < 190; i += 44, y += 28) g.fillText(msg.slice(i, i + 44), 12, y);
+  panelTex.needsUpdate = true; panelUntil = performance.now() / 1000 + 60;
+};
+
+/* =====================================================================
+   Desktop preview (third person) so the page also works without a headset
+   ===================================================================== */
+const keys = {};
+window.addEventListener('keydown', (e) => { keys[e.code] = true; });
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+const pv = { pos: SPAWN.clone(), vel: V3(), camYaw: 0, camPitch: 0.25, dist: 3.4, phase: 0, heading: 0, ground: false };
+let dragging = false;
+canvas.addEventListener('pointerdown', () => { dragging = true; });
+window.addEventListener('pointerup', () => { dragging = false; });
+window.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  pv.camYaw -= e.movementX * 0.006; pv.camPitch = clamp(pv.camPitch + e.movementY * 0.005, -0.3, 1.2);
+});
+canvas.addEventListener('wheel', (e) => { pv.dist = clamp(pv.dist + e.deltaY * 0.003, 1.5, 9); e.preventDefault(); }, { passive: false });
+const _pq = new THREE.Quaternion(), _pe = new THREE.Euler();
+
+function stepPreview(dt) {
+  const mx = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0), mz = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
+  const sy = Math.sin(pv.camYaw), cy = Math.cos(pv.camYaw);
+  const wish = _a.set(mx * cy - mz * sy, 0, -mx * sy - mz * cy);       // forward = (-sin, -cos), right = (cos, -sin)
+  if (wish.lengthSq() > 0) wish.normalize();
+  const speed = keys.ShiftLeft || keys.ShiftRight ? 6.5 : 4;
+  pv.vel.x += (wish.x * speed - pv.vel.x) * Math.min(1, dt * 10);
+  pv.vel.z += (wish.z * speed - pv.vel.z) * Math.min(1, dt * 10);
+  pv.vel.y -= GRAVITY * dt;
+  if (keys.Space && pv.ground) pv.vel.y = 5;
+  pv.pos.addScaledVector(pv.vel, dt);
+  pv.ground = false;
+  _c.set(pv.pos.x, pv.pos.y + 0.3, pv.pos.z); _b.copy(_c);
+  if (pushOut(_c, 0.3, _n)) {
+    pv.pos.add(_a.copy(_c).sub(_b));
+    const vn = pv.vel.dot(_n); if (vn < 0) pv.vel.addScaledVector(_n, -vn);
+    if (_n.y > 0.6) pv.ground = true;
+  }
+  if (pv.pos.y < -30) { pv.pos.copy(SPAWN); pv.vel.set(0, 0, 0); }
+
+  const hs = Math.hypot(pv.vel.x, pv.vel.z), sp = Math.min(1, hs / 4);
+  if (hs > 0.3) { const target = Math.atan2(-pv.vel.x, -pv.vel.z); let d = target - pv.heading; d = Math.atan2(Math.sin(d), Math.cos(d)); pv.heading += d * Math.min(1, dt * 8); }
+  pv.phase += dt * (2 + sp * 7);
+
+  // synthetic pose: head + swinging hands
+  pose.head.set(pv.pos.x, pv.pos.y + 1.6 - BODY_DROP, pv.pos.z);
+  pose.q.setFromEuler(_pe.set(0, pv.heading, 0));
+  const fwd = T.fwd.set(-Math.sin(pv.heading), 0, -Math.cos(pv.heading));
+  const right = T.right.set(Math.cos(pv.heading), 0, -Math.sin(pv.heading));
+  [pose.L, pose.R].forEach((hs, i) => {
+    const h = hs.p, sd = i === 0 ? -1 : 1, ph = pv.phase + (i === 0 ? 0 : Math.PI);
+    h.set(pose.head.x, pose.head.y - 0.235 - 0.6, pose.head.z)
+      .addScaledVector(right, sd * 0.36)
+      .addScaledVector(fwd, Math.sin(ph) * 0.34 * sp + 0.05 + Math.sin(pv.phase * 0.5 + i) * 0.015 * (1 - sp));
+    h.y += Math.max(0, Math.cos(ph)) * 0.18 * sp;
+    if (h.y < HAND_R) h.y = HAND_R;
+    hs.hasQ = false; hs.i = hs.m = hs.t = 0.15;
+  });
+  avatar.update(dt, pose.head, pose.q, pose.L, pose.R);
+
+  const tgt = T.b.set(pose.head.x, pose.head.y - 0.35, pose.head.z);
+  const cp = Math.cos(pv.camPitch);
+  camera.position.set(tgt.x + Math.sin(pv.camYaw) * cp * pv.dist, tgt.y + Math.sin(pv.camPitch) * pv.dist, tgt.z + Math.cos(pv.camYaw) * cp * pv.dist);
+  camera.lookAt(tgt);
+}
+
+/* =====================================================================
+   Main loop
+   ===================================================================== */
+function resize() {
+  if (renderer.xr.isPresenting) return;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+
+respawn();
+const clock = new THREE.Clock();
+function frame() {
+  const dt = Math.min(clock.getDelta(), 1 / 20);
+  const inXR = renderer.xr.isPresenting;
+  try {
+    if (inXR) stepXR(dt); else stepPreview(dt);
+    updateMirror(dt);
+  } catch (e) { fail('Update error: ' + e.message); }
+  panel.visible = inXR && performance.now() / 1000 < panelUntil;
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(frame);
+checkXR();
+
+window.__sludge = { THREE, scene, camera, rig, renderer, avatar, mirrorAvatar, pose, pv, loco, hands, stepLocomotion, stepXR, updateMirror, ctrls, grips, handL, pushOut, respawn, keys, BODY_DROP };
+})();
+</script>
+</body>
+</html>
